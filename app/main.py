@@ -5,7 +5,12 @@ import os
 
 from fastapi import FastAPI, HTTPException, Query, Response
 
-from .logic import evaluate_finish, evaluate_permit_request
+from .logic import (
+    detect_vote_loss_events,
+    evaluate_finish,
+    evaluate_permit_request,
+    healthy_vote_count,
+)
 from .manifest import load_manifest
 from .models import PermitRecord, now_utc, to_iso
 from .schemas import LivenessBatchIn, PermitRequestIn
@@ -56,7 +61,14 @@ def create_app(db_path: str, manifest_path: str) -> FastAPI:
                 status_code=422,
                 detail={"error": "unknown_nodes", "unknown_nodes": unknown},
             )
-        store.add_reports(batch.reports)
+        # 单事务：插探活 -> 比较整批生效前后各分片票数 -> 开/补缺票记录，
+        # 一同提交或回滚；并发批次在写事务中按提交顺序串行生效。
+        with store.transaction():
+            before = store.latest_reports()
+            store.insert_reports(batch.reports)
+            after = store.latest_reports()
+            events = detect_vote_loss_events(manifest, before, after)
+            store.apply_vote_loss_events(events, observed_at=now_utc())
         return {"accepted": len(batch.reports)}
 
     @app.get("/liveness")
@@ -87,6 +99,34 @@ def create_app(db_path: str, manifest_path: str) -> FastAPI:
             "sampled_at": to_iso(rep.sampled_at),
             "healthy": rep.healthy,
             "boot_id": rep.boot_id,
+        }
+
+    # ---- 缺票时段 ----
+
+    @app.get("/shards/{shard}/vote-losses")
+    def get_shard_vote_losses(shard: str):
+        if shard not in manifest.shards:
+            raise HTTPException(
+                status_code=404,
+                detail={"error": "unknown_shard", "shard": shard},
+            )
+        voters = manifest.shards[shard]
+        return {
+            "shard": shard,
+            "voters": list(voters),
+            "majority_needed": manifest.majority_needed(shard),
+            "current_healthy_votes": healthy_vote_count(
+                voters, store.latest_reports()
+            ),
+            "periods": [
+                {
+                    "id": p.id,
+                    "started_at": to_iso(p.started_at),
+                    "recovered_at": to_iso(p.recovered_at) if p.recovered_at else None,
+                    "status": "open" if p.recovered_at is None else "recovered",
+                }
+                for p in store.list_vote_losses(shard)
+            ],
         }
 
     # ---- 许可 ----

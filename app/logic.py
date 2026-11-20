@@ -2,7 +2,38 @@
 from __future__ import annotations
 
 from .manifest import Manifest
-from .models import LatestReport, PermitRecord
+from .models import LatestReport, PermitRecord, VoteLossEvent
+
+
+def healthy_vote_count(
+    voters: tuple[str, ...], latest: dict[str, LatestReport]
+) -> int:
+    """固定投票清单中，最新探活报告健康的节点数（即有效票数）。"""
+    return sum(
+        1 for v in voters if (rep := latest.get(v)) is not None and rep.healthy
+    )
+
+
+def detect_vote_loss_events(
+    manifest: Manifest,
+    before: dict[str, LatestReport],
+    after: dict[str, LatestReport],
+) -> list[VoteLossEvent]:
+    """比较一批探活生效前后各分片的有效票数，返回状态翻转事件。
+
+    从过半降到不过半 -> lost；从不过半恢复过半 -> recovered；其余无事件。
+    过期/重复上报不改变生效状态（before == after），自然不会产生事件。
+    """
+    events: list[VoteLossEvent] = []
+    for shard, voters in sorted(manifest.shards.items()):
+        needed = manifest.majority_needed(shard)
+        b = healthy_vote_count(voters, before)
+        a = healthy_vote_count(voters, after)
+        if b >= needed and a < needed:
+            events.append(VoteLossEvent(shard, "lost", b, a))
+        elif b < needed and a >= needed:
+            events.append(VoteLossEvent(shard, "recovered", b, a))
+    return events
 
 
 def evaluate_permit_request(

@@ -14,6 +14,9 @@
 - **同号同批重发**返回原许可（HTTP 200）；同号不同批返回 409。
 - 许可与探活记录落盘 SQLite，**服务重启后保留**。
 - **结束许可**要求本批每个节点的最新探活：在获批后采集、健康、启动标识与获批时不同。
+- **缺票时段**：每批探活生效时，按固定投票清单比较生效前后各分片的有效票数
+  （每节点取采样时间最新的探活，仅健康计票）。从过半跌到不过半就开一条缺票记录，
+  恢复过半就给同一条记录补上恢复时间；可按分片查询，未恢复的记录恢复时间留空。
 
 ## 快速开始（Docker Compose）
 
@@ -63,6 +66,7 @@ pytest tests/ -q
 | POST | `/liveness` | 批量上报探活（201） |
 | GET | `/liveness` | 全部节点最新探活 |
 | GET | `/liveness/{node}` | 单节点最新探活 |
+| GET | `/shards/{shard}/vote-losses` | 按分片查询缺票时段（未恢复的记录 `recovered_at` 为 null） |
 | POST | `/permits` | 申请许可（201 新批 / 200 幂等重发 / 409 拒绝） |
 | GET | `/permits?status=open\|finished` | 许可列表 |
 | GET | `/permits/{request_id}` | 单个许可 |
@@ -140,14 +144,62 @@ curl -X POST http://localhost:8000/permits/req-001/finish
 可能原因：`no_liveness_report`、`not_sampled_after_approval`、`unhealthy`、`boot_id_unchanged`。
 许可结束后节点被释放，可被后续申请占用。
 
+### 5. 维护期间产生缺票，按分片查询缺票时段
+
+`req-001` 占用 n1 期间，n2 也上报异常，shard-a 有效票数从 3 跌到 1（过半线 2），
+服务观察到缺票并开出记录：
+
+```bash
+curl -X POST http://localhost:8000/liveness \
+  -H 'Content-Type: application/json' -d '{
+    "reports":[{"node_id":"n2","sampled_at":"2026-11-19T10:10:00Z",
+                "healthy":false,"boot_id":"boot-1"}]}'
+# => {"accepted":1}
+
+curl http://localhost:8000/shards/shard-a/vote-losses
+# 200 =>
+# {"shard":"shard-a","voters":["n1","n2","n3"],"majority_needed":2,
+#  "current_healthy_votes":1,
+#  "periods":[{"id":1,"started_at":"2026-11-19T10:10:01.2+00:00",
+#              "recovered_at":null,"status":"open"}]}
+```
+
+n2 恢复健康、票数回到过半后，同一条记录补上恢复时间：
+
+```bash
+curl -X POST http://localhost:8000/liveness \
+  -H 'Content-Type: application/json' -d '{
+    "reports":[{"node_id":"n2","sampled_at":"2026-11-19T10:25:00Z",
+                "healthy":true,"boot_id":"boot-2"}]}'
+
+curl http://localhost:8000/shards/shard-a/vote-losses
+# "periods":[{"id":1,"started_at":"...","recovered_at":"2026-11-19T10:25:01.8+00:00",
+#             "status":"recovered"}]
+```
+
+说明：
+
+- `started_at` / `recovered_at` 是**服务观察到**翻转的时间（不是节点采样时间）；
+  尚未恢复时 `recovered_at` 为 `null`、`status` 为 `open`。
+- 计票只看固定投票清单内节点**采样时间最新**的探活，且仅健康计票；
+  过期（采样时间更旧）或重复上报不改变生效状态，不会改写缺票记录。
+- 翻转按**整批**生效前后比较：一批内先异常后恢复（更新采样时间生效）净结果不变，
+  不产生记录；一批多个节点同时异常也只开一条记录。
+- 探活与其衍生的缺票记录在**同一事务**提交或回滚；并发批次按提交顺序串行生效。
+- 缺票记录落盘 SQLite，服务重启后仍可查询，未结束的记录会被后续上报继续更新。
+
 ## 设计说明
 
 - **幂等**：`request_id` 是许可表主键。节点集合规范化（去重排序）后比较，
   同号同批重放直接返回原许可；同号不同批 409。被拒绝的申请不落库，整改后可用同号重试。
 - **并发**：所有写路径走单连接 + 可重入锁 + `BEGIN IMMEDIATE` 事务，
   "检查多数票 → 写入许可"是原子的；并发申请串行判定，不会超批。
-- **持久化**：许可与全部探活报告存 SQLite（WAL 模式），最新探活按
+- **持久化**：许可、全部探活报告与缺票时段存 SQLite（WAL 模式），最新探活按
   `max(sampled_at)` 实时计算，服务重启后状态完整恢复。
+- **缺票时段**：`POST /liveness` 在同一写事务里完成"插探活 → 比较整批生效前后
+  各分片票数 → 开/补缺票记录"，要么一起提交要么一起回滚；并发批次在
+  `BEGIN IMMEDIATE` 事务中按提交顺序串行生效。`vote_loss_periods` 表用部分唯一索引
+  保证同一分片至多一条未结束记录。
 - **结束判定**：批准时快照各节点 `boot_id`；结束时要求最新报告
   `sampled_at > approved_at` 且健康且 `boot_id` 不同。
 
@@ -158,3 +210,6 @@ curl -X POST http://localhost:8000/permits/req-001/finish
 - 探活无"过期"概念：只要最新一份健康即视为健康，不判断采样时间新旧。
 - 结束许可比较的是节点上报的采样时钟与服务端获批时钟，依赖各节点时钟基本同步（NTP）。
 - 许可无过期/自动回收机制；值班员需显式 finish。
+- 缺票时段只记录"服务观察到过半之后又跌破"的翻转：服务首次启动时若票数本就
+  不过半，不会补开记录；`started_at`/`recovered_at` 用的是服务端时钟。
+- 缺票查询暂不支持按时间范围/状态过滤，也不提供跨分片汇总接口。

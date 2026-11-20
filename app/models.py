@@ -31,6 +31,30 @@ class LatestReport:
 
 
 @dataclass(frozen=True)
+class VoteLossEvent:
+    """一次多数票状态翻转。kind: lost（跌破过半）| recovered（恢复过半）。"""
+
+    shard: str
+    kind: str
+    votes_before: int
+    votes_after: int
+
+
+@dataclass(frozen=True)
+class VoteLossPeriod:
+    """一段缺票时段：某分片有效票数跌破过半线到恢复过半的区间。
+
+    started_at / recovered_at 均为服务端观察到对应翻转的时间；
+    recovered_at 为 None 表示尚未恢复。
+    """
+
+    id: int
+    shard: str
+    started_at: datetime
+    recovered_at: datetime | None
+
+
+@dataclass(frozen=True)
 class PermitRecord:
     """一条许可。status: open（未结束）| finished（已结束）。"""
 
